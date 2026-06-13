@@ -1,0 +1,86 @@
+# ddwrt — Agent Operating Guide
+
+Native OpenTofu/Terraform provider for **DD-WRT routers** driven over **SSH**.
+Sibling of `../tofu-tomato`, `../tofu-aruba-aos`, and `../openwrt-ubus` (same
+generic-over-the-device philosophy, same toolchain). The workspace-root
+`../CLAUDE.md` applies; this adds specifics.
+
+## What this is / isn't
+
+- **Is:** a provider for DD-WRT firmware (the Broadcom/Atheros third-party
+  firmware), managing **NVRAM** generically over SSH.
+- **Isn't:** an OpenWrt provider (that's `../openwrt-ubus`, ubus-over-HTTP), a
+  Tomato provider (that's `../tofu-tomato` — different service-control verbs),
+  or a REST provider — DD-WRT has no clean REST API.
+
+## Transport — SSH, and why (decision record)
+
+DD-WRT keeps all config in **NVRAM**. Two transports were considered:
+
+- **HTTP (httpd):** Basic-auth web UI; writes POST `var=value` form fields to
+  `/apply.cgi` with `submit_button` / `action` / `service`. Writing is workable.
+  **Reading is the dealbreaker:** there is no CGI that returns a single NVRAM
+  value; status pages embed values inside inline JavaScript, so a read means
+  scraping + per-build parsing.
+- **SSH (Dropbear):** `nvram get <k>` / `nvram set k=v` / `nvram unset k` /
+  `nvram commit` / `stopservice`/`startservice <svc>` / `rc restart`. Reads are
+  exact and structured for **any** variable, firmware-independent.
+
+The manage-declared-only subset model **needs** an exact read of each declared
+key to compute a 0-diff on import. HTTP cannot give that cleanly; SSH gives it
+trivially. **SSH is therefore the strictly cleaner transport for a generic
+NVRAM resource — that is the chosen transport.**
+
+We invoke the **system `ssh` binary** via `os/exec` (not an in-process SSH
+library). This (a) keeps the module dependency set byte-for-byte unchanged — no
+`golang.org/x/crypto/ssh` — per the build constraint, and (b) reuses the lab's
+existing SSH machinery: Dropbear key auth or OpenBao-signed SSH certs live in
+`ssh_config`/agent exactly as for every other lab host, so the provider never
+handles a private key. `ssh -o BatchMode=yes` ensures it fails fast instead of
+hanging on a prompt (cf. the prod-lab "net-routers plan shell SSH hang" lesson).
+
+## Service control — DD-WRT differs from Tomato/Asuswrt (decision record)
+
+DD-WRT has **no `service <svc> restart`** (that is Tomato) and **no
+`restart_<svc>`** (that is Asuswrt/Merlin). It exposes:
+
+- `stopservice <svc>` / `startservice <svc>` — cycle one named service, and
+- `rc restart` — re-run the entire service init (the safe "apply NVRAM" idiom).
+
+So the restart form is a **provider-level configurable template**
+(`restart_command`, default `stopservice {service}; startservice {service}`).
+The resource's `restart` attribute names the service; `*`/`all`/`rc` short-
+circuit to a full `rc restart` regardless of the template. Empty `restart` is a
+no-op (keys read live / applied on reboot).
+
+## Design tenets
+
+- **The generic resource is `ddwrt_nvram`** (+ data source). `keys` is a JSON
+  object of the NVRAM variables managed; everything else in NVRAM is left alone.
+- **The subset plan modifier is `nvramSubsetMatches`** — declared keys all match
+  device → 0-diff; otherwise the drift surfaces as an update. NVRAM is
+  stringly-typed, so values are compared as strings.
+- **Restore-on-destroy is exact.** `previous` snapshots each managed key's prior
+  value (or absence) at create/import; destroy restores set→value or
+  unset→gone, then commits + restarts.
+- **`nvram get` cannot distinguish unset from set-empty** (both print nothing),
+  so `GetNVRAM` probes `nvram show` for `key=` to return a correct `present`.
+
+## Toolchain
+
+- Go 1.26.4 (`/home/jameson/.local/go`), `terraform-plugin-framework` v1.19.0.
+- **Do not add or bump dependencies** — the SSH transport shells out precisely
+  so `go.mod` stays unchanged. Versions are reused from `../tofu-tomato`.
+- Provider address: `registry.terraform.io/jamesonrgrieve/ddwrt`. Binary:
+  `terraform-provider-ddwrt`. Single-token TypeName `ddwrt` so resources are
+  `ddwrt_nvram` (the Go module / repo carry the `tofu-` prefix).
+- `make check` = tidy + fmt + vet + test + build; `.githooks/pre-commit` re-runs
+  the gate. Never `--no-verify`.
+
+## Hard rules
+
+- **No secrets in the repo.** Creds come from the provider config / ssh_config
+  (OpenBao-signed certs via the lab's normal SSH path).
+- **Lab target is change-windowed / off.** The DD-WRT lab VM is powered off;
+  build + unit-test only. Do not power it on or run live acceptance tests.
+- Drive any future live changes via Semaphore, plan-first, 0-diff.
