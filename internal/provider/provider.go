@@ -111,7 +111,7 @@ func (p *ddwrtProvider) Configure(ctx context.Context, req provider.ConfigureReq
 }
 
 func (p *ddwrtProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewObjectResource}
+	return []func() resource.Resource{NewObjectResource, NewReconcileResource}
 }
 
 func (p *ddwrtProvider) DataSources(_ context.Context) []func() datasource.DataSource {
